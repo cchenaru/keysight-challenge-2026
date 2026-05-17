@@ -15,6 +15,7 @@
 
 #include <rte_common.h>
 #include <rte_log.h>
+#include <rte_ring.h>
 #include <rte_malloc.h>
 #include <rte_memory.h>
 #include <rte_eal.h>
@@ -89,6 +90,43 @@ struct netem_port_statistics port_statistics[NB_PORTS];
 /* A tsc-based timer responsible for triggering statistics printout */
 static uint64_t timer_period = 1; /* default period is 1 seconds */
 
+// The queues
+#define NUM_PROFILE_QUEUES 10
+#define QUEUE_SIZE 1024
+
+static struct rte_ring *profile_queues[NUM_PROFILE_QUEUES];
+
+enum queue_action {
+    ACTION_FORWARD,
+    ACTION_DROP,
+    ACTION_DUPLICATE,
+    ACTION_DELAY,
+    ACTION_DROP_DUPLICATE,
+    ACTION_DROP_DELAY,
+    ACTION_DUPLICATE_DELAY
+};
+
+struct queue_rule {
+    enum queue_action action;
+    uint32_t drop_every;
+    uint32_t duplicate_every;
+    uint32_t delay_us;
+    uint64_t packet_count;
+};
+
+static struct queue_rule queue_rules[NUM_PROFILE_QUEUES] = {
+    { ACTION_FORWARD,         0, 0, 0,     0 },      // PQ0
+    { ACTION_DROP,           10, 0, 0,     0 },      // PQ1
+    { ACTION_DROP,            5, 0, 0,     0 },      // PQ2
+    { ACTION_DUPLICATE,       0, 10, 0,    0 },      // PQ3
+    { ACTION_DUPLICATE,       0, 3, 0,     0 },      // PQ4
+    { ACTION_DELAY,           0, 0, 1000,  0 },      // PQ5
+    { ACTION_DELAY,           0, 0, 10000, 0 },      // PQ6
+    { ACTION_DROP_DUPLICATE, 10, 10, 0,    0 },      // PQ7
+    { ACTION_DROP_DELAY,      5, 0, 1000,  0 },      // PQ8
+    { ACTION_DUPLICATE_DELAY, 0, 5, 10000, 0 }       // PQ9
+};
+
 static inline int
 classify_packet(struct rte_mbuf *m)
 {
@@ -96,11 +134,12 @@ classify_packet(struct rte_mbuf *m)
     int i;
 
     data = rte_pktmbuf_mtod(m, uint8_t *);
+	data += sizeof(struct rte_ether_hdr);
 
     /*
      * Check to be at least 12 bytes.
      */
-    if (rte_pktmbuf_pkt_len(m) < 12)
+    if (rte_pktmbuf_pkt_len(m) < sizeof(struct rte_ether_hdr) + 12)
         return 0;
 
     for (i = 0; i < 10; i++) {
@@ -217,7 +256,7 @@ netem_main_loop(void)
 
 					/* do this only on main core */
 					if (lcore_id == rte_get_main_lcore()) {
-						// print_stats();
+						print_stats();
 						/* reset the timer */
 						timer_tsc = 0;
 					}
@@ -241,15 +280,11 @@ netem_main_loop(void)
 			// Clasify packet
 			int queue_id = classify_packet(m);
 
-			uint8_t *data = rte_pktmbuf_mtod(m, uint8_t *);
-
-			printf("queue_id=%d | first 12 bytes: ", queue_id);
-
-			for (int j = 0; j < 12; j++) {
-			printf("%c", data[j]);
+			if (rte_ring_enqueue(profile_queues[queue_id], m) < 0) {
+				port_statistics[rx_port_id].dropped++;
+				rte_pktmbuf_free(m);
+				continue;
 			}
-
-			printf("\n");
 
 			/* Drop one in 10 packets, the 5th one. */
 			// if (i % 10 == 5) {
@@ -259,14 +294,113 @@ netem_main_loop(void)
 			// 	rte_pktmbuf_free(m);
 			// 	continue;
 			// }
+		}
 
-			rte_prefetch0(rte_pktmbuf_mtod(m, void *));
+		// Process/send packets from queues
+		int queue_pkt_count[NUM_PROFILE_QUEUES] = {0};
+		for (int q = 0; q < NUM_PROFILE_QUEUES; q++) {
+			struct rte_mbuf *queued_pkt;
 
-			buffer = tx_buffer[tx_port_id];
+			while (rte_ring_dequeue(profile_queues[q], (void **)&queued_pkt) == 0) {
+				queue_pkt_count[q]++;
 
-			sent = rte_eth_tx_buffer(tx_port_id, 0, buffer, m);
-			if (sent)
-				port_statistics[tx_port_id].tx += sent;
+				bool should_drop = false;
+				int duplicates = 0;
+
+				switch (q) {
+				case 0:
+					// forward normal
+					break;
+
+				case 1:
+					// drop 1 packet out of 10
+					if (queue_pkt_count[q] % 10 == 0)
+						should_drop = true;
+					break;
+
+				case 2:
+					// drop 2 packets out of 10
+					if (queue_pkt_count[q] % 10 == 0 ||
+						queue_pkt_count[q] % 10 == 5)
+						should_drop = true;
+					break;
+
+				case 3:
+					// duplicate 1 packet out of 10
+					if (queue_pkt_count[q] % 10 == 0)
+						duplicates = 1;
+					break;
+
+				case 4:
+					// duplicate 3 packets out of 10
+					if (queue_pkt_count[q] % 10 == 0 ||
+						queue_pkt_count[q] % 10 == 3 ||
+						queue_pkt_count[q] % 10 == 6)
+						duplicates = 1;
+					break;
+
+				case 5:
+					// forward normal for now
+					// TODO: delay 1ms
+					break;
+
+				case 6:
+					// forward normal for now
+					// TODO: delay 10ms
+					break;
+
+				case 7:
+					// drop 1/10 + duplicate 1/10
+					if (queue_pkt_count[q] % 10 == 0)
+						should_drop = true;
+					else if (queue_pkt_count[q] % 10 == 5)
+						duplicates = 1;
+					break;
+
+				case 8:
+					// drop 2/10
+					// TODO: plus delay 1ms
+					if (queue_pkt_count[q] % 10 == 0 ||
+						queue_pkt_count[q] % 10 == 5)
+						should_drop = true;
+					break;
+
+				case 9:
+					// duplicate 2/10
+					// TODO: plus delay 10ms
+					if (queue_pkt_count[q] % 10 == 0 ||
+						queue_pkt_count[q] % 10 == 5)
+						duplicates = 1;
+					break;
+				}
+
+				if (should_drop) {
+					port_statistics[rx_port_id].dropped++;
+					rte_pktmbuf_free(queued_pkt);
+					continue;
+				}
+
+				rte_prefetch0(rte_pktmbuf_mtod(queued_pkt, void *));
+
+				buffer = tx_buffer[tx_port_id];
+
+				for (int d = 0; d < duplicates; d++) {
+					struct rte_mbuf *clone =
+						rte_pktmbuf_clone(queued_pkt, netem_pktmbuf_pool);
+
+					if (clone != NULL) {
+						sent = rte_eth_tx_buffer(tx_port_id, 0, buffer, clone);
+						if (sent)
+							port_statistics[tx_port_id].tx += sent;
+					} else {
+						port_statistics[rx_port_id].dropped++;
+					}
+				}
+
+				sent = rte_eth_tx_buffer(tx_port_id, 0, buffer, queued_pkt);
+				if (sent)
+					port_statistics[tx_port_id].tx += sent;
+			}
 		}
 	}
 }
@@ -305,6 +439,24 @@ main(int argc, char **argv)
 		rte_exit(EXIT_FAILURE, "Invalid EAL arguments\n");
 	argc -= ret;
 	argv += ret;
+
+	char queue_name[32];
+	for (int i = 0; i < NUM_PROFILE_QUEUES; i++) {
+		snprintf(queue_name, sizeof(queue_name),
+				"PROFILE_QUEUE_%d", i);
+
+		profile_queues[i] = rte_ring_create(
+			queue_name,
+			QUEUE_SIZE,
+			rte_socket_id(),
+			RING_F_SP_ENQ | RING_F_SC_DEQ
+		);
+
+		if (profile_queues[i] == NULL) {
+			rte_exit(EXIT_FAILURE,
+					"Cannot create queue %d\n", i);
+		}
+	}
 
 	force_quit = false;
 	signal(SIGINT, signal_handler);
