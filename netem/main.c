@@ -78,7 +78,7 @@ static struct rte_eth_conf port_conf = {
 };
 
 static void print_stats(void) {
-  uint64_t total_tx = 0, total_rx = 0, total_dropped = 0, total_pattern1 = 0;
+  uint64_t total_tx = 0, total_rx = 0, total_dropped = 0;
 
   const char clr[] = {27, '[', '2', 'J', '\0'};
   const char topLeft[] = {27, '[', '1', ';', '1', 'H', '\0'};
