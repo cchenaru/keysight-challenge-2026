@@ -16,6 +16,7 @@ RUN apt update && apt install -y curl \
         libnuma-dev \
         libpcap-dev \
         libelf-dev \
+        libmicrohttpd-dev \
         && rm -rf /var/lib/apt/lists/*
 
 # Setup student user
@@ -34,13 +35,14 @@ RUN cd /home/student/dpdk && ninja -C build install && ldconfig
 
 # Setup the challenge app (done as student to ensure correct permissions)
 USER student
-RUN cd /home/student  && git clone https://github.com/cchenaru/keysight-challenge-2026.git challenge-app
+RUN cd /home/student  && git clone https://github.com/PeterGabriel9/antigel-keysight.git challenge-app
 
 RUN cd /home/student/challenge-app/netem && meson setup build
 
 RUN cd /home/student/challenge-app/netem && ninja -C build
 
-COPY input.pcap /home/student/input.pcap
+COPY --chown=student:student input.pcap /home/student/input.pcap
+RUN touch /home/student/output.pcap
 
 # Switch back to root so ttyd can execute 'login'
 USER root
