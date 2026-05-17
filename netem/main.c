@@ -39,7 +39,9 @@
 #define NB_PORTS 2
 #define RING_SIZE 4096
 #define N_CLASS_THREADS 4
-
+#define TCP_DEST_PORT_MEDIAN 35730
+#define IP_MEDIAN_PREFIX 30
+#define TCP_DEST_PORT_MASK 2
 #define LCORE_RX 0
 #define LCORE_WORKER1 1
 #define LCORE_WORKER2 2
@@ -113,22 +115,22 @@ static void *classifier_thread(__rte_unused void *arg) {
   while (!force_quit) {
 
     if (rte_ring_dequeue(task_ring, (void **)&m) < 0) {
+      // busy wait with rte_pause for optimisation
       rte_pause();
       continue;
     }
     rte_prefetch0(rte_pktmbuf_mtod(m, void *));
 
     int dst_id = 0;
+    // get ethernet header
     struct rte_ether_hdr *eth = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
 
-#define TCP_DEST_PORT_MEDIAN 35730
-#define IP_PREFIX_MASK 8
-#define TCP_DEST_PORT_MASK 2
     if (eth->ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4)) {
+    // get ip header
       struct rte_ipv4_hdr *ip = (struct rte_ipv4_hdr *)(eth + 1);
       uint32_t src = rte_be_to_cpu_32(ip->src_addr);
       struct rte_tcp_hdr *tcp = (struct rte_tcp_hdr *)(ip + 1);
-      if (((src >> 24) & 0xFF) == 30)
+      if (((src >> 24) & 0xFF) == IP_MEDIAN_PREFIX)
         dst_id |= 4;
       if (tcp->dst_port < TCP_DEST_PORT_MEDIAN)
         dst_id |= 2;
@@ -136,6 +138,7 @@ static void *classifier_thread(__rte_unused void *arg) {
         dst_id |= 1;
     }
 
+    // add the packet to the right queue
     if (rte_ring_enqueue(profile_queue[dst_id], m) < 0) {
       rte_pktmbuf_free(m);
       port_statistics[0].dropped++;
@@ -145,11 +148,13 @@ static void *classifier_thread(__rte_unused void *arg) {
 }
 
 static void init_classifier_pool(void) {
+  // init threads
   for (int i = 0; i < N_CLASS_THREADS; i++)
     pthread_create(&class_threads[i], NULL, classifier_thread, NULL);
 }
 
 static void destroy_classifier_pool(void) {
+  // destroy threads
   for (int i = 0; i < N_CLASS_THREADS; i++)
     pthread_join(class_threads[i], NULL);
 }
@@ -181,6 +186,8 @@ static void io_rx_loop(void) {
 
     port_statistics[0].rx += nb_rx;
 
+    /* enqueue the packets for the threads to consume
+    reading must be done on a single thread as it is not a safe thread operation*/
     uint16_t enqueued =
         rte_ring_enqueue_burst(task_ring, (void **)bursts, nb_rx, NULL);
 
@@ -198,6 +205,7 @@ static void worker_multi_queue(int start_q, int end_q) {
   while (!force_quit) {
     bool worked = false;
 
+    // iterate over the range of profile queue's and apply the logic based on the queue configuration
     for (int q = start_q; q < end_q; q++) {
 
       uint16_t n = rte_ring_dequeue_burst(profile_queue[q], (void **)bursts,
@@ -205,6 +213,8 @@ static void worker_multi_queue(int start_q, int end_q) {
       if (!n)
         continue;
 
+      // this flag is used in order to tone down the core as it is busy waiting
+      // on the queue rings
       worked = true;
 
       bool duplicate = (q % 2 != 0);
@@ -341,6 +351,7 @@ int main(int argc, char **argv) {
   tx_ring =
       rte_ring_create("tx", RING_SIZE * 2, rte_socket_id(), RING_F_SC_DEQ);
 
+  // init all rings
   for (int i = 0; i < 8; ++i) {
     char name[10];
     snprintf(name, sizeof(name), "pq%d", i);
