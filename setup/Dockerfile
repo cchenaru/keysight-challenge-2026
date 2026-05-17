@@ -32,15 +32,21 @@ RUN cd /home/student/dpdk && meson setup -Denable_apps="testpmd" -Dexamples="l2f
 USER root
 RUN cd /home/student/dpdk && ninja -C build install && ldconfig
 
-# Setup the challenge app (done as student to ensure correct permissions)
+# Setup the challenge app using LOCAL files
+USER root
+RUN mkdir -p /home/student/challenge-app/netem
+# Copy the local netem directory to the container
+COPY netem /home/student/challenge-app/netem
+RUN chown -R student:student /home/student/challenge-app
+
 USER student
-RUN cd /home/student  && git clone https://github.com/cchenaru/keysight-challenge-2026.git challenge-app
+WORKDIR /home/student/challenge-app/netem
+RUN rm -rf build && meson setup build
+RUN ninja -C build
 
-RUN cd /home/student/challenge-app/netem && meson setup build
-
-RUN cd /home/student/challenge-app/netem && ninja -C build
-
-COPY input.pcap /home/student/input.pcap
+USER root
+COPY setup/input.pcap /home/student/input.pcap
+RUN chown student:student /home/student/input.pcap
 
 # Switch back to root so ttyd can execute 'login'
 USER root

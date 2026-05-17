@@ -33,7 +33,11 @@
 #include <rte_mbuf.h>
 #include <rte_string_fns.h>
 
+#include "main.h"
+
 static volatile bool force_quit;
+
+static void print_stats(void);
 
 #define RTE_LOGTYPE_NETEM RTE_LOGTYPE_USER1
 
@@ -78,7 +82,7 @@ static uint64_t timer_period = 1; /* default period is 1 seconds */
 
 /* Print out statistics on packets dropped */
 static void
-print_stats(void)
+print_stats_old(void)
 {
 	uint64_t total_packets_dropped, total_packets_tx, total_packets_rx;
 	unsigned portid;
@@ -123,7 +127,7 @@ print_stats(void)
 
 /* main processing loop */
 static void
-netem_main_loop(void)
+netem_main_loop_old(void)
 {
 	struct rte_mbuf *pkts_burst[MAX_PKT_BURST];
 	struct rte_mbuf *m;
@@ -198,24 +202,139 @@ netem_main_loop(void)
 		port_statistics[rx_port_id].rx += nb_rx;
 
 		for (i = 0; i < nb_rx; i++) {
+			// TODO - paralelism
 			m = pkts_burst[i];
-
-			/* Drop one in 10 packets, the 5th one. */
-			if (i % 10 == 5) {
-				/* ToDo: correctly drop based on total RX packets, not
-				 * while iterating the burst (e.g. 32 packets burst)
-				 */
-				rte_pktmbuf_free(m);
-				continue;
-			}
-
 			rte_prefetch0(rte_pktmbuf_mtod(m, void *));
 
-			buffer = tx_buffer[tx_port_id];
+			// 1. Clasificăm pachetul
+			int queue_id = classify_packet(m);
 
-			sent = rte_eth_tx_buffer(tx_port_id, 0, buffer, m);
+			// 2. Aplicăm proprietățile și îl transmitem
+			apply_changes(m, queue_id, tx_port_id);
+		}
+	}
+}
+
+/* Modificare în print_stats ca să afișeze și structura ta de stats */
+static void
+print_stats(void)
+{
+	uint64_t total_packets_dropped, total_packets_tx, total_packets_rx;
+	unsigned portid;
+
+	total_packets_dropped = 0;
+	total_packets_tx = 0;
+	total_packets_rx = 0;
+
+	const char clr[] = { 27, '[', '2', 'J', '\0' };
+	const char topLeft[] = { 27, '[', '1', ';', '1', 'H','\0' };
+
+	printf("%s%s", clr, topLeft);
+	printf("\nPort statistics ====================================");
+
+	for (portid = 0; portid < NB_PORTS; portid++) {
+		printf("\nStatistics for port %u ------------------------------"
+			   "\nPackets sent: %24"PRIu64
+			   "\nPackets received: %20"PRIu64
+			   "\nPackets dropped: %21"PRIu64,
+			   portid,
+			   port_statistics[portid].tx,
+			   port_statistics[portid].rx,
+			   port_statistics[portid].dropped);
+
+		total_packets_dropped += port_statistics[portid].dropped;
+		total_packets_tx += port_statistics[portid].tx;
+		total_packets_rx += port_statistics[portid].rx;
+	}
+	
+	// --- ADĂUGAT NOU: Afișare statistici per profil coadă ---
+	printf("\n\nQueue Profiles Breakdown ============================");
+	printf("\nQID | Received | Dropped  | Queued   | DUP Rate");
+	printf("\n----------------------------------------------------");
+	for (int i = 0; i < NUM_PROFILES; i++) {
+		uint64_t recv = __atomic_load_n(&my_queues[i].stats.total_received, __ATOMIC_RELAXED);
+		if (recv > 0) {
+			uint64_t drop = __atomic_load_n(&my_queues[i].stats.total_dropped, __ATOMIC_RELAXED);
+			uint64_t sent = __atomic_load_n(&my_queues[i].stats.total_sent, __ATOMIC_RELAXED);
+			printf("\nQ%-2d | %8"PRIu64" | %8"PRIu64" | %8"PRIu64" | %d/10",
+				   i, recv, drop, sent, my_queues[i].dup_rate);
+		}
+	}
+
+	printf("\n====================================================\n");
+	fflush(stdout);
+}
+
+
+/* Modificare în inima loop-ului principal */
+static void
+netem_main_loop(void)
+{
+	struct rte_mbuf *pkts_burst[MAX_PKT_BURST];
+	struct rte_mbuf *m;
+	int sent;
+	unsigned lcore_id;
+	uint64_t prev_tsc, diff_tsc, cur_tsc, timer_tsc;
+	unsigned i, nb_rx;
+	const uint64_t drain_tsc = (rte_get_tsc_hz() + US_PER_S - 1) / US_PER_S *
+			BURST_TX_DRAIN_US;
+	struct rte_eth_dev_tx_buffer *buffer;
+
+	prev_tsc = 0;
+	timer_tsc = 0;
+	lcore_id = rte_lcore_id();
+
+	uint16_t rx_port_id = lcore_id;
+	uint16_t tx_port_id = lcore_id ^ 1;
+
+	printf("lcore_id %u, tx %u, rx %u\n", lcore_id, tx_port_id, rx_port_id);
+	RTE_LOG(INFO, NETEM, "entering main loop on lcore %u\n", lcore_id);
+
+	while (!force_quit) {
+		cur_tsc = rte_rdtsc();
+
+		// --- ADĂUGAT NOU: Verificare și trimitere pachete din Heap (Scheduler) ---
+		while (heap_get_size(tx_port_id) > 0 && heap_peek_time(tx_port_id) <= cur_tsc) {
+			delayed_packet_t pkt = heap_pop(tx_port_id);
+			sent = rte_eth_tx_buffer(tx_port_id, 0, tx_buffer[tx_port_id], pkt.m);
 			if (sent)
 				port_statistics[tx_port_id].tx += sent;
+		}
+
+		/* Drains the TX queue after a certain time */
+		diff_tsc = cur_tsc - prev_tsc;
+		if (unlikely(diff_tsc > drain_tsc)) {
+			buffer = tx_buffer[tx_port_id];
+
+			sent = rte_eth_tx_buffer_flush(tx_port_id, 0, buffer);
+			if (sent)
+				port_statistics[tx_port_id].tx += sent;
+
+			if (timer_period > 0) {
+				timer_tsc += diff_tsc;
+				if (unlikely(timer_tsc >= timer_period)) {
+					if (lcore_id == rte_get_main_lcore()) {
+						print_stats();
+						timer_tsc = 0;
+					}
+				}
+			}
+			prev_tsc = cur_tsc;
+		}
+
+		/* Read packet from RX queue */
+		nb_rx = rte_eth_rx_burst(rx_port_id, 0, pkts_burst, MAX_PKT_BURST);
+		if (unlikely(nb_rx == 0))
+			continue;
+
+		port_statistics[rx_port_id].rx += nb_rx;
+
+		for (i = 0; i < nb_rx; i++) {
+			m = pkts_burst[i];
+			rte_prefetch0(rte_pktmbuf_mtod(m, void *));
+
+			int queue_id = classify_packet(m);
+			apply_changes(m, queue_id, tx_port_id);
 		}
 	}
 }
@@ -298,6 +417,7 @@ main(int argc, char **argv)
 		if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE)
 			local_port_conf.txmode.offloads |=
 				RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
+
 		/* Configure the number of queues for a port. */
 		ret = rte_eth_dev_configure(portid, 1, 1, &local_port_conf);
 		if (ret < 0)
@@ -385,6 +505,7 @@ main(int argc, char **argv)
 
 	ret = 0;
 	/* launch per-lcore init on every lcore */
+	init_queues();
 	rte_eal_mp_remote_launch(netem_launch_one_lcore, NULL, CALL_MAIN);
 	RTE_LCORE_FOREACH_WORKER(lcore_id) {
 		if (rte_eal_wait_lcore(lcore_id) < 0) {
