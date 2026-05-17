@@ -1,7 +1,9 @@
+#include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
 #include <getopt.h>
 #include <inttypes.h>
+#include <netinet/in.h>
 #include <setjmp.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -71,6 +73,7 @@ struct __rte_cache_aligned netem_port_statistics {
   uint64_t tx;
   uint64_t rx;
   uint64_t dropped;
+  uint64_t pattern1;
 };
 struct netem_port_statistics port_statistics[NB_PORTS];
 
@@ -79,12 +82,14 @@ static uint64_t timer_period = 1; /* default period is 1 seconds */
 
 /* Print out statistics on packets dropped */
 static void print_stats(void) {
-  uint64_t total_packets_dropped, total_packets_tx, total_packets_rx;
+  uint64_t total_packets_dropped, total_packets_tx, total_packets_rx,
+      total_packets_pattern1;
   unsigned portid;
 
   total_packets_dropped = 0;
   total_packets_tx = 0;
   total_packets_rx = 0;
+  total_packets_pattern1 = 0;
 
   const char clr[] = {27, '[', '2', 'J', '\0'};
   const char topLeft[] = {27, '[', '1', ';', '1', 'H', '\0'};
@@ -97,19 +102,22 @@ static void print_stats(void) {
   for (portid = 0; portid < NB_PORTS; portid++) {
     printf("\nStatistics for port %u ------------------------------"
            "\nPackets sent: %24" PRIu64 "\nPackets received: %20" PRIu64
-           "\nPackets dropped: %21" PRIu64,
+           "\nPackets dropped: %21" PRIu64 "\nPattern1 packets: %20" PRIu64,
            portid, port_statistics[portid].tx, port_statistics[portid].rx,
-           port_statistics[portid].dropped);
+           port_statistics[portid].dropped, port_statistics[portid].pattern1);
 
     total_packets_dropped += port_statistics[portid].dropped;
     total_packets_tx += port_statistics[portid].tx;
     total_packets_rx += port_statistics[portid].rx;
+    total_packets_pattern1 += port_statistics[portid].pattern1;
   }
   printf("\nAggregate statistics ==============================="
          "\nTotal packets sent: %18" PRIu64
          "\nTotal packets received: %14" PRIu64
-         "\nTotal packets dropped: %15" PRIu64,
-         total_packets_tx, total_packets_rx, total_packets_dropped);
+         "\nTotal packets dropped: %15" PRIu64
+         "\nTotal packets pattern1: %15" PRIu64,
+         total_packets_tx, total_packets_rx, total_packets_dropped,
+         total_packets_pattern1);
   printf("\n====================================================\n");
 
   fflush(stdout);
@@ -118,6 +126,8 @@ static void print_stats(void) {
 /* main processing loop */
 static void netem_main_loop(void) {
   struct rte_mbuf *pkts_burst[MAX_PKT_BURST];
+  struct rte_mbuf *pattern1_burst[MAX_PKT_BURST];
+  struct rte_mbuf *default_burst[MAX_PKT_BURST];
   struct rte_mbuf *m;
   int sent;
   unsigned lcore_id;
@@ -189,25 +199,66 @@ static void netem_main_loop(void) {
 
     port_statistics[rx_port_id].rx += nb_rx;
 
+    // pattern 1 = sursa ip sa fie de forma 30.0.0.0/24
+    uint16_t pattern1_count = 0;
+    uint16_t default_count = 0;
+
     for (i = 0; i < nb_rx; i++) {
       m = pkts_burst[i];
-
-      /* Drop one in 10 packets, the 5th one. */
-      if (i % 2 == 1) {
-        /* ToDo: correctly drop based on total RX packets, not
-         * while iterating the burst (e.g. 32 packets burst)
-         */
-        rte_pktmbuf_free(m);
-        continue;
-      }
-
       rte_prefetch0(rte_pktmbuf_mtod(m, void *));
+      struct rte_ether_hdr *eth_hdr =
+          rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
 
+      if (eth_hdr->ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4)) {
+        struct rte_ipv4_hdr *ipv4_hdr = (struct rte_ipv4_hdr *)(eth_hdr + 1);
+        uint8_t *src_ip = (uint8_t *)&ipv4_hdr->src_addr;
+        // printf("src addr : %x \n", ipv4_hdr->src_addr);
+        // for (int j = 0; j < 4; j++) {
+        //   printf("%u ", src_ip[j]);
+        // }
+        // printf("\n");
+
+        if (src_ip[0] == 30 && src_ip[1] == 0 && src_ip[2] == 0) {
+          pattern1_burst[pattern1_count++] = m;
+          continue;
+        }
+      }
+      default_burst[default_count++] = m;
+    }
+    if (pattern1_count > 0) {
       buffer = tx_buffer[tx_port_id];
 
-      sent = rte_eth_tx_buffer(tx_port_id, 0, buffer, m);
-      if (sent)
-        port_statistics[tx_port_id].tx += sent;
+      for (int i = 0; i < pattern1_count; i++) {
+        // pattern 1 duplicates half of packets
+        if (i % 2 == 1) {
+          sent = rte_eth_tx_burst(tx_port_id, 0, &pattern1_burst[i], 1);
+          if (sent) {
+            port_statistics[tx_port_id].pattern1 += sent;
+            port_statistics[tx_port_id].tx += sent;
+          }
+        } else {
+          sent = rte_eth_tx_burst(tx_port_id, 0, &pattern1_burst[i], 1);
+          if (sent) {
+            port_statistics[tx_port_id].pattern1 += sent;
+            port_statistics[tx_port_id].tx += sent;
+          }
+          sent = rte_eth_tx_burst(tx_port_id, 0, &pattern1_burst[i], 1);
+          if (sent) {
+            port_statistics[tx_port_id].pattern1 += sent;
+            port_statistics[tx_port_id].tx += sent;
+          }
+        }
+      }
+    }
+
+    if (default_count > 0) {
+      buffer = tx_buffer[tx_port_id];
+      for (int i = 0; i < default_count; i++) {
+        sent = rte_eth_tx_burst(tx_port_id, 0, &default_burst[i], 1);
+        if (sent) {
+          port_statistics[tx_port_id].tx += sent;
+        }
+      }
     }
   }
 }
