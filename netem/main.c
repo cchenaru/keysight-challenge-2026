@@ -36,17 +36,25 @@
 
 static volatile bool force_quit;
 
-static const uint8_t patterns[10][12] = {
-    "000000000001",
-    "000000000010",
-    "000000000100",
-    "000000001000",
-    "000000010000",
-    "000000100000",
-    "000001000000",
-    "000010000000",
-    "000100000000",
-    "001000000000"
+/* 10 hardcoded (flow_id, direction) patterns.
+ * direction byte is at offset 8 (cc or cd in the pcap),
+ * flow_id byte is at offset 30. */
+struct pattern {
+    uint8_t flow_id;
+    uint8_t direction;
+};
+
+static const struct pattern patterns[10] = {
+    { 0x16, 0xcd },   /* PQ0 */
+    { 0x16, 0xcc },   /* PQ1 */
+    { 0x26, 0xcd },   /* PQ2 */
+    { 0x26, 0xcc },   /* PQ3 */
+    { 0x36, 0xcd },   /* PQ4 */
+    { 0x36, 0xcc },   /* PQ5 */
+    { 0x53, 0xcd },   /* PQ6 */
+    { 0x53, 0xcc },   /* PQ7 */
+    { 0x63, 0xcd },   /* PQ8 */
+    { 0x63, 0xcc },   /* PQ9 */
 };
 
 #define RTE_LOGTYPE_NETEM RTE_LOGTYPE_USER1
@@ -92,65 +100,77 @@ static uint64_t timer_period = 1; /* default period is 1 seconds */
 
 // The queues
 #define NUM_PROFILE_QUEUES 10
-#define QUEUE_SIZE 1024
+#define NUM_WORKERS 2
+#define QUEUE_SIZE 4096
+#define INPUT_RING_SIZE 4096
 
-static struct rte_ring *profile_queues[NUM_PROFILE_QUEUES];
+/* Input ring: RX thread pushes raw packets, workers consume */
+static struct rte_ring *input_ring;
 
-enum queue_action {
-    ACTION_FORWARD,
-    ACTION_DROP,
-    ACTION_DUPLICATE,
-    ACTION_DELAY,
-    ACTION_DROP_DUPLICATE,
-    ACTION_DROP_DELAY,
-    ACTION_DUPLICATE_DELAY
-};
+/* Per-queue rings: workers push processed (timestamped) packets, TX consumes */
+static struct rte_ring *queue_rings[NUM_PROFILE_QUEUES];
+
+/* TX-side "pending head" — one held-back packet per queue while waiting
+ * for its release_time to arrive */
+static struct rte_mbuf *pending[NUM_PROFILE_QUEUES];
+
+/* Per-queue packet counter for deterministic drop/dup decisions.
+ * Multiple workers may touch the same queue — use atomic add. */
+static uint64_t pkt_count[NUM_PROFILE_QUEUES];
+
+/* Fixed ports: RX from port 0, TX to port 1 */
+static uint16_t rx_port = 0;
+static uint16_t tx_port = 1;
 
 struct queue_rule {
-    enum queue_action action;
     uint32_t drop_every;
     uint32_t duplicate_every;
     uint32_t delay_us;
-    uint64_t packet_count;
 };
 
 static struct queue_rule queue_rules[NUM_PROFILE_QUEUES] = {
-    { ACTION_FORWARD,         0, 0, 0,     0 },      // PQ0
-    { ACTION_DROP,           10, 0, 0,     0 },      // PQ1
-    { ACTION_DROP,            5, 0, 0,     0 },      // PQ2
-    { ACTION_DUPLICATE,       0, 10, 0,    0 },      // PQ3
-    { ACTION_DUPLICATE,       0, 3, 0,     0 },      // PQ4
-    { ACTION_DELAY,           0, 0, 1000,  0 },      // PQ5
-    { ACTION_DELAY,           0, 0, 10000, 0 },      // PQ6
-    { ACTION_DROP_DUPLICATE, 10, 10, 0,    0 },      // PQ7
-    { ACTION_DROP_DELAY,      5, 0, 1000,  0 },      // PQ8
-    { ACTION_DUPLICATE_DELAY, 0, 5, 10000, 0 }       // PQ9
+    /*  drop_every, dup_every, delay_us */
+    {   0,           0,         0     },   /* PQ0: passthrough */
+    {  10,           0,         0     },   /* PQ1: drop 1/10 */
+    {   5,           0,         0     },   /* PQ2: drop 1/5 */
+    {   0,          10,         0     },   /* PQ3: dup 1/10 */
+    {   0,           3,         0     },   /* PQ4: dup 1/3 */
+    {   0,           0,      1000     },   /* PQ5: 1ms delay */
+    {   0,           0,     10000     },   /* PQ6: 10ms delay */
+    {  10,          10,         0     },   /* PQ7: drop + dup */
+    {   5,           0,      1000     },   /* PQ8: drop + delay */
+    {   0,           5,     10000     },   /* PQ9: dup + delay */
 };
 
 static inline int
 classify_packet(struct rte_mbuf *m)
 {
     uint8_t *data;
+    uint32_t len;
     int i;
 
     data = rte_pktmbuf_mtod(m, uint8_t *);
-	data += sizeof(struct rte_ether_hdr);
+    len = rte_pktmbuf_pkt_len(m);
 
     /*
-     * Check to be at least 12 bytes.
+     * Check to be at least 32 bytes (we look at byte 8 and byte 30).
      */
-    if (rte_pktmbuf_pkt_len(m) < sizeof(struct rte_ether_hdr) + 12)
-        return 0;
+    if (len < 32)
+        return NUM_PROFILE_QUEUES - 1;  /* default queue */
 
-    for (i = 0; i < 10; i++) {
-        if (memcmp(data, patterns[i], 12) == 0)
+    uint8_t direction = data[8];
+    uint8_t flow_id   = data[30];
+
+    for (i = 0; i < NUM_PROFILE_QUEUES; i++) {
+        if (patterns[i].flow_id == flow_id &&
+            patterns[i].direction == direction)
             return i;
     }
 
     /*
      * Default queue.
      */
-    return 0;
+    return NUM_PROFILE_QUEUES - 1;
 }
 
 /* Print out statistics on packets dropped */
@@ -198,52 +218,161 @@ print_stats(void)
 	fflush(stdout);
 }
 
-/* main processing loop */
-static void
-netem_main_loop(void)
+/* RX thread: read packets from input port, push raw into input_ring. */
+static int
+rx_thread(__rte_unused void *arg)
 {
 	struct rte_mbuf *pkts_burst[MAX_PKT_BURST];
+	unsigned nb_rx;
+
+	printf("RX thread on lcore %u, rx_port %u\n", rte_lcore_id(), rx_port);
+	RTE_LOG(INFO, NETEM, "entering RX loop on lcore %u\n", rte_lcore_id());
+
+	while (!force_quit) {
+		/* Read packet from RX queue */
+		nb_rx = rte_eth_rx_burst(rx_port, 0, pkts_burst, MAX_PKT_BURST);
+		if (unlikely(nb_rx == 0))
+			/* Nothing received? Continue. */
+			continue;
+
+		port_statistics[rx_port].rx += nb_rx;
+
+		/* Push the whole burst into input_ring at once. */
+		unsigned enq = rte_ring_enqueue_burst(input_ring,
+		                                     (void **)pkts_burst,
+		                                     nb_rx, NULL);
+
+		/* Any packets that didn't fit get dropped. */
+		for (unsigned i = enq; i < nb_rx; i++) {
+			rte_pktmbuf_free(pkts_burst[i]);
+			port_statistics[rx_port].dropped++;
+		}
+	}
+	return 0;
+}
+
+/* Worker thread: pop from input_ring, classify, apply drop/duplicate,
+ * stamp release_time, push to queue_rings[q]. */
+static int
+worker_thread(void *arg)
+{
+	int worker_id = (int)(uintptr_t)arg;
 	struct rte_mbuf *m;
+
+	printf("Worker %d on lcore %u\n", worker_id, rte_lcore_id());
+	RTE_LOG(INFO, NETEM, "entering worker loop on lcore %u\n", rte_lcore_id());
+
+	while (!force_quit) {
+		if (rte_ring_dequeue(input_ring, (void **)&m) != 0)
+			continue;
+
+		/* Classify packet */
+		int queue_id = classify_packet(m);
+		struct queue_rule *r = &queue_rules[queue_id];
+
+		/* Atomic counter so multiple workers don't race when deciding
+		 * drop/dup for the same queue. */
+		uint64_t count = __atomic_add_fetch(&pkt_count[queue_id], 1,
+		                                    __ATOMIC_RELAXED);
+
+		/* Drop check */
+		if (r->drop_every && (count % r->drop_every) == 0) {
+			/* ToDo: correctly drop based on total RX packets, not
+			 * while iterating the burst (e.g. 32 packets burst)
+			 */
+			rte_pktmbuf_free(m);
+			port_statistics[rx_port].dropped++;
+			continue;
+		}
+
+		/* Compute release_time = now + delay */
+		uint64_t delay_cycles =
+			(uint64_t)r->delay_us * rte_get_tsc_hz() / 1000000ULL;
+		uint64_t release = rte_rdtsc() + delay_cycles;
+
+		/* Duplicate check */
+		if (r->duplicate_every && (count % r->duplicate_every) == 0) {
+			struct rte_mbuf *clone =
+				rte_pktmbuf_clone(m, netem_pktmbuf_pool);
+			if (clone != NULL) {
+				clone->udata64 = release;
+				if (rte_ring_enqueue(queue_rings[queue_id], clone) < 0) {
+					rte_pktmbuf_free(clone);
+					port_statistics[rx_port].dropped++;
+				}
+			} else {
+				port_statistics[rx_port].dropped++;
+			}
+		}
+
+		/* Stamp the original and push */
+		m->udata64 = release;
+		if (rte_ring_enqueue(queue_rings[queue_id], m) < 0) {
+			rte_pktmbuf_free(m);
+			port_statistics[rx_port].dropped++;
+		}
+	}
+	return 0;
+}
+
+/* TX thread: peek each queue_ring, pick the packet with the earliest
+ * release_time that's already due, send it out. */
+static int
+tx_thread(__rte_unused void *arg)
+{
+	struct rte_eth_dev_tx_buffer *buffer;
 	int sent;
-	unsigned lcore_id;
 	uint64_t prev_tsc, diff_tsc, cur_tsc, timer_tsc;
-	unsigned i, nb_rx;
 	const uint64_t drain_tsc = (rte_get_tsc_hz() + US_PER_S - 1) / US_PER_S *
 			BURST_TX_DRAIN_US;
-	struct rte_eth_dev_tx_buffer *buffer;
 
 	prev_tsc = 0;
 	timer_tsc = 0;
 
-	lcore_id = rte_lcore_id();
-
-	/* On the RX path, the lcore reads the packets from it's port.
-	 * For lcore_id 0, set the rx_port_id to 0.
-	 * For lcore_id 1, set the rx_port_id to 1.
-	 */
-	uint16_t rx_port_id = lcore_id;
-
-	/* On the TX path, the lcore will send the packets to the other port
-	 * For lcore_id 0, set the tx_port_id to 1.
-	 * For lcore_id 1, set the tx_port_id to 0.
-	 */
-	uint16_t tx_port_id = lcore_id ^ 1;
-
-	printf("lcore_id %u, tx %u, rx %u\n", lcore_id, tx_port_id, rx_port_id);
-
-	RTE_LOG(INFO, NETEM, "entering main loop on lcore %u\n", lcore_id);
+	printf("TX thread on lcore %u, tx_port %u\n", rte_lcore_id(), tx_port);
+	RTE_LOG(INFO, NETEM, "entering TX loop on lcore %u\n", rte_lcore_id());
 
 	while (!force_quit) {
-		/* Drains the TX queue after a certain time */
 		cur_tsc = rte_rdtsc();
 
+		/* Top up pending slot for each queue */
+		for (int q = 0; q < NUM_PROFILE_QUEUES; q++) {
+			if (pending[q] == NULL)
+				rte_ring_dequeue(queue_rings[q], (void **)&pending[q]);
+		}
+
+		/* Find the queue whose pending packet has the smallest
+		 * release_time AND is already due (release_time <= now). */
+		int best_q = -1;
+		uint64_t best_time = UINT64_MAX;
+		for (int q = 0; q < NUM_PROFILE_QUEUES; q++) {
+			if (pending[q] == NULL)
+				continue;
+			if (pending[q]->udata64 > cur_tsc)
+				continue;
+			if (pending[q]->udata64 < best_time) {
+				best_time = pending[q]->udata64;
+				best_q = q;
+			}
+		}
+
+		if (best_q >= 0) {
+			buffer = tx_buffer[tx_port];
+			rte_prefetch0(rte_pktmbuf_mtod(pending[best_q], void *));
+			sent = rte_eth_tx_buffer(tx_port, 0, buffer, pending[best_q]);
+			if (sent)
+				port_statistics[tx_port].tx += sent;
+			pending[best_q] = NULL;
+		}
+
+		/* Drains the TX queue after a certain time */
 		diff_tsc = cur_tsc - prev_tsc;
 		if (unlikely(diff_tsc > drain_tsc)) {
-			buffer = tx_buffer[tx_port_id];
+			buffer = tx_buffer[tx_port];
 
-			sent = rte_eth_tx_buffer_flush(tx_port_id, 0, buffer);
+			sent = rte_eth_tx_buffer_flush(tx_port, 0, buffer);
 			if (sent)
-				port_statistics[tx_port_id].tx += sent;
+				port_statistics[tx_port].tx += sent;
 
 			/* if timer is enabled */
 			if (timer_period > 0) {
@@ -255,7 +384,7 @@ netem_main_loop(void)
 				if (unlikely(timer_tsc >= timer_period)) {
 
 					/* do this only on main core */
-					if (lcore_id == rte_get_main_lcore()) {
+					if (rte_lcore_id() == rte_get_main_lcore()) {
 						print_stats();
 						/* reset the timer */
 						timer_tsc = 0;
@@ -265,150 +394,7 @@ netem_main_loop(void)
 
 			prev_tsc = cur_tsc;
 		}
-
-		/* Read packet from RX queue */
-		nb_rx = rte_eth_rx_burst(rx_port_id, 0, pkts_burst, MAX_PKT_BURST);
-		if (unlikely(nb_rx == 0))
-			/*  Nothing received? Continue. */
-			continue;
-
-		port_statistics[rx_port_id].rx += nb_rx;
-
-		for (i = 0; i < nb_rx; i++) {
-			m = pkts_burst[i];
-
-			// Clasify packet
-			int queue_id = classify_packet(m);
-
-			if (rte_ring_enqueue(profile_queues[queue_id], m) < 0) {
-				port_statistics[rx_port_id].dropped++;
-				rte_pktmbuf_free(m);
-				continue;
-			}
-
-			/* Drop one in 10 packets, the 5th one. */
-			// if (i % 10 == 5) {
-			// 	/* ToDo: correctly drop based on total RX packets, not
-			// 	 * while iterating the burst (e.g. 32 packets burst)
-			// 	 */
-			// 	rte_pktmbuf_free(m);
-			// 	continue;
-			// }
-		}
-
-		// Process/send packets from queues
-		int queue_pkt_count[NUM_PROFILE_QUEUES] = {0};
-		for (int q = 0; q < NUM_PROFILE_QUEUES; q++) {
-			struct rte_mbuf *queued_pkt;
-
-			while (rte_ring_dequeue(profile_queues[q], (void **)&queued_pkt) == 0) {
-				queue_pkt_count[q]++;
-
-				bool should_drop = false;
-				int duplicates = 0;
-
-				switch (q) {
-				case 0:
-					// forward normal
-					break;
-
-				case 1:
-					// drop 1 packet out of 10
-					if (queue_pkt_count[q] % 10 == 0)
-						should_drop = true;
-					break;
-
-				case 2:
-					// drop 2 packets out of 10
-					if (queue_pkt_count[q] % 10 == 0 ||
-						queue_pkt_count[q] % 10 == 5)
-						should_drop = true;
-					break;
-
-				case 3:
-					// duplicate 1 packet out of 10
-					if (queue_pkt_count[q] % 10 == 0)
-						duplicates = 1;
-					break;
-
-				case 4:
-					// duplicate 3 packets out of 10
-					if (queue_pkt_count[q] % 10 == 0 ||
-						queue_pkt_count[q] % 10 == 3 ||
-						queue_pkt_count[q] % 10 == 6)
-						duplicates = 1;
-					break;
-
-				case 5:
-					// forward normal for now
-					// TODO: delay 1ms
-					break;
-
-				case 6:
-					// forward normal for now
-					// TODO: delay 10ms
-					break;
-
-				case 7:
-					// drop 1/10 + duplicate 1/10
-					if (queue_pkt_count[q] % 10 == 0)
-						should_drop = true;
-					else if (queue_pkt_count[q] % 10 == 5)
-						duplicates = 1;
-					break;
-
-				case 8:
-					// drop 2/10
-					// TODO: plus delay 1ms
-					if (queue_pkt_count[q] % 10 == 0 ||
-						queue_pkt_count[q] % 10 == 5)
-						should_drop = true;
-					break;
-
-				case 9:
-					// duplicate 2/10
-					// TODO: plus delay 10ms
-					if (queue_pkt_count[q] % 10 == 0 ||
-						queue_pkt_count[q] % 10 == 5)
-						duplicates = 1;
-					break;
-				}
-
-				if (should_drop) {
-					port_statistics[rx_port_id].dropped++;
-					rte_pktmbuf_free(queued_pkt);
-					continue;
-				}
-
-				rte_prefetch0(rte_pktmbuf_mtod(queued_pkt, void *));
-
-				buffer = tx_buffer[tx_port_id];
-
-				for (int d = 0; d < duplicates; d++) {
-					struct rte_mbuf *clone =
-						rte_pktmbuf_clone(queued_pkt, netem_pktmbuf_pool);
-
-					if (clone != NULL) {
-						sent = rte_eth_tx_buffer(tx_port_id, 0, buffer, clone);
-						if (sent)
-							port_statistics[tx_port_id].tx += sent;
-					} else {
-						port_statistics[rx_port_id].dropped++;
-					}
-				}
-
-				sent = rte_eth_tx_buffer(tx_port_id, 0, buffer, queued_pkt);
-				if (sent)
-					port_statistics[tx_port_id].tx += sent;
-			}
-		}
 	}
-}
-
-static int
-netem_launch_one_lcore(__rte_unused void *dummy)
-{
-	netem_main_loop();
 	return 0;
 }
 
@@ -430,7 +416,7 @@ main(int argc, char **argv)
 	uint16_t nb_ports_available = 0;
 	uint16_t portid;
 	unsigned lcore_id;
-	unsigned int nb_lcores = 2;
+	unsigned int nb_lcores = NUM_WORKERS + 2;  /* RX + workers + TX */
 	unsigned int nb_mbufs;
 
 	/* Init EAL */
@@ -440,19 +426,28 @@ main(int argc, char **argv)
 	argc -= ret;
 	argv += ret;
 
+	/* Create the input ring: RX is the sole producer (SP),
+	 * workers are multiple consumers (no SC flag). */
+	input_ring = rte_ring_create("INPUT_RING", INPUT_RING_SIZE,
+	                             rte_socket_id(), RING_F_SP_ENQ);
+	if (input_ring == NULL)
+		rte_exit(EXIT_FAILURE, "Cannot create input ring\n");
+
+	/* Create the per-queue rings: workers are multiple producers
+	 * (no SP flag), TX is the sole consumer (SC). */
 	char queue_name[32];
 	for (int i = 0; i < NUM_PROFILE_QUEUES; i++) {
 		snprintf(queue_name, sizeof(queue_name),
 				"PROFILE_QUEUE_%d", i);
 
-		profile_queues[i] = rte_ring_create(
+		queue_rings[i] = rte_ring_create(
 			queue_name,
 			QUEUE_SIZE,
 			rte_socket_id(),
-			RING_F_SP_ENQ | RING_F_SC_DEQ
+			RING_F_SC_DEQ
 		);
 
-		if (profile_queues[i] == NULL) {
+		if (queue_rings[i] == NULL) {
 			rte_exit(EXIT_FAILURE,
 					"Cannot create queue %d\n", i);
 		}
@@ -586,9 +581,42 @@ main(int argc, char **argv)
 		rte_exit(EXIT_FAILURE, "No ports available\n");
 	}
 
+	/* Lcore assignment:
+	 *   main lcore   -> TX thread (runs inline)
+	 *   first worker -> RX thread
+	 *   rest         -> worker threads (NUM_WORKERS of them)
+	 * Requires at least NUM_WORKERS + 2 lcores. Pass -l 0-3 (or wider). */
+	unsigned int rx_lcore = 0;
+	unsigned int worker_lcores[NUM_WORKERS];
+	int wi = 0;
+	int rx_assigned = 0;
+
+	RTE_LCORE_FOREACH_WORKER(lcore_id) {
+		if (!rx_assigned) {
+			rx_lcore = lcore_id;
+			rx_assigned = 1;
+		} else if (wi < NUM_WORKERS) {
+			worker_lcores[wi++] = lcore_id;
+		}
+	}
+
+	if (!rx_assigned || wi < NUM_WORKERS) {
+		rte_exit(EXIT_FAILURE,
+			"Need at least %d lcores total. Use -l 0-%d on the command line.\n",
+			NUM_WORKERS + 2, NUM_WORKERS + 1);
+	}
+
+	rte_eal_remote_launch(rx_thread, NULL, rx_lcore);
+	for (int w = 0; w < NUM_WORKERS; w++) {
+		rte_eal_remote_launch(worker_thread, (void *)(uintptr_t)w,
+		                      worker_lcores[w]);
+	}
+
+	/* TX runs on the main lcore */
 	ret = 0;
-	/* launch per-lcore init on every lcore */
-	rte_eal_mp_remote_launch(netem_launch_one_lcore, NULL, CALL_MAIN);
+	tx_thread(NULL);
+
+	/* Wait for everyone */
 	RTE_LCORE_FOREACH_WORKER(lcore_id) {
 		if (rte_eal_wait_lcore(lcore_id) < 0) {
 			ret = -1;
