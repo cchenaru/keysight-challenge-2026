@@ -1,5 +1,6 @@
 #include <arpa/inet.h>
 #include <errno.h>
+#include <generic/rte_pause.h>
 #include <inttypes.h>
 #include <netinet/in.h>
 #include <pthread.h>
@@ -54,9 +55,8 @@ static struct rte_eth_dev_tx_buffer *tx_buffer[NB_PORTS];
 static struct rte_mempool *netem_pktmbuf_pool;
 
 static struct rte_ring *task_ring;
-static struct rte_ring *pattern1_ring;
-static struct rte_ring *default_ring;
 static struct rte_ring *tx_ring;
+static struct rte_ring *profile_queue[8];
 
 static pthread_t class_threads[N_CLASS_THREADS];
 
@@ -66,7 +66,7 @@ struct __rte_cache_aligned netem_port_statistics {
   uint64_t tx;
   uint64_t rx;
   uint64_t dropped;
-  uint64_t pattern1;
+  uint64_t pattern[8];
 };
 struct netem_port_statistics port_statistics[NB_PORTS];
 
@@ -88,23 +88,21 @@ static void print_stats(void) {
   for (unsigned p = 0; p < NB_PORTS; p++) {
     printf("\nStatistics for port %u ------------------------------"
            "\nPackets sent: %24" PRIu64 "\nPackets received: %20" PRIu64
-           "\nPackets dropped: %21" PRIu64 "\nPattern1 packets: %20" PRIu64,
+           "\nPackets dropped: %21" PRIu64,
            p, port_statistics[p].tx, port_statistics[p].rx,
-           port_statistics[p].dropped, port_statistics[p].pattern1);
+           port_statistics[p].dropped);
 
     total_tx += port_statistics[p].tx;
     total_rx += port_statistics[p].rx;
     total_dropped += port_statistics[p].dropped;
-    total_pattern1 += port_statistics[p].pattern1;
   }
 
   printf("\nAggregate statistics ==============================="
          "\nTotal packets sent: %18" PRIu64
          "\nTotal packets received: %14" PRIu64
          "\nTotal packets dropped: %15" PRIu64
-         "\nTotal packets pattern1: %15" PRIu64
          "\n====================================================\n",
-         total_tx, total_rx, total_dropped, total_pattern1);
+         total_tx, total_rx, total_dropped);
 
   fflush(stdout);
 }
@@ -118,27 +116,31 @@ static void *classifier_thread(__rte_unused void *arg) {
       rte_pause();
       continue;
     }
-
     rte_prefetch0(rte_pktmbuf_mtod(m, void *));
 
-    struct rte_ring *dst = default_ring;
+    int dst_id = 0;
     struct rte_ether_hdr *eth = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
 
+#define TCP_DEST_PORT_MEDIAN 35730
+#define IP_PREFIX_MASK 8
+#define TCP_DEST_PORT_MASK 2
     if (eth->ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4)) {
       struct rte_ipv4_hdr *ip = (struct rte_ipv4_hdr *)(eth + 1);
       uint32_t src = rte_be_to_cpu_32(ip->src_addr);
-
-      if (((src >> 24) & 0xFF) == 30 && ((src >> 16) & 0xFF) == 0 &&
-          ((src >> 8) & 0xFF) == 0)
-        dst = pattern1_ring;
+      struct rte_tcp_hdr *tcp = (struct rte_tcp_hdr *)(ip + 1);
+      if (((src >> 24) & 0xFF) == 30)
+        dst_id |= 4;
+      if (tcp->dst_port < TCP_DEST_PORT_MEDIAN)
+        dst_id |= 2;
+      if (tcp->tcp_flags & RTE_TCP_SYN_FLAG)
+        dst_id |= 1;
     }
 
-    if (rte_ring_enqueue(dst, m) < 0) {
+    if (rte_ring_enqueue(profile_queue[dst_id], m) < 0) {
       rte_pktmbuf_free(m);
       port_statistics[0].dropped++;
     }
   }
-
   return NULL;
 }
 
@@ -189,52 +191,68 @@ static void io_rx_loop(void) {
   }
 }
 
-static void worker_pattern1_loop(void) {
+static void worker_multi_queue(int start_q, int end_q) {
   struct rte_mbuf *bursts[MAX_PKT_BURST];
   struct rte_mbuf *out[MAX_PKT_BURST * 2];
 
   while (!force_quit) {
-    uint16_t n = rte_ring_dequeue_burst(pattern1_ring, (void **)bursts,
-                                        MAX_PKT_BURST, NULL);
-    if (!n)
-      continue;
+    bool worked = false;
 
-    uint16_t out_n = 0;
-    for (uint16_t i = 0; i < n; i++) {
-      out[out_n++] = bursts[i];
+    for (int q = start_q; q < end_q; q++) {
+
+      uint16_t n = rte_ring_dequeue_burst(profile_queue[q], (void **)bursts,
+                                          MAX_PKT_BURST, NULL);
+      if (!n)
+        continue;
+
+      worked = true;
+
+      bool duplicate = (q % 2 != 0);
+      int drop_rate = q * 2;
+
+      uint16_t out_n = 0;
+
+      for (uint16_t i = 0; i < n; i++) {
+
+        if (drop_rate > 0 && (rte_rand() % 100) < drop_rate) {
+          rte_pktmbuf_free(bursts[i]);
+          port_statistics[1].dropped++;
+          continue;
+        }
+
+        out[out_n++] = bursts[i];
+
+        if (duplicate) {
+          struct rte_mbuf *clone =
+              rte_pktmbuf_clone(bursts[i], netem_pktmbuf_pool);
+          if (likely(clone != NULL)) {
+            out[out_n++] = clone;
+          } else {
+            port_statistics[1].dropped++;
+          }
+        }
+      }
+
+      if (out_n > 0) {
+        uint16_t enqueued =
+            rte_ring_enqueue_burst(tx_ring, (void **)out, out_n, NULL);
+        port_statistics[1].pattern[q] += enqueued;
+
+        for (uint16_t i = enqueued; i < out_n; i++) {
+          rte_pktmbuf_free(out[i]);
+          port_statistics[1].dropped++;
+        }
+      }
     }
-
-    uint16_t enqueued =
-        rte_ring_enqueue_burst(tx_ring, (void **)out, out_n, NULL);
-    port_statistics[1].pattern1 += enqueued;
-
-    for (uint16_t i = enqueued; i < out_n; i++) {
-      rte_pktmbuf_free(out[i]);
-      port_statistics[1].dropped++;
-    }
-  }
-}
-
-static void worker_default_loop(void) {
-  struct rte_mbuf *bursts[MAX_PKT_BURST];
-
-  while (!force_quit) {
-    uint16_t n = rte_ring_dequeue_burst(default_ring, (void **)bursts,
-                                        MAX_PKT_BURST, NULL);
-    if (!n)
-      continue;
-
-    uint16_t enqueued =
-        rte_ring_enqueue_burst(tx_ring, (void **)bursts, n, NULL);
-    for (uint16_t i = enqueued; i < n; i++) {
-      rte_pktmbuf_free(bursts[i]);
-      port_statistics[1].dropped++;
+    if (!worked) {
+      rte_pause();
     }
   }
 }
 
 static void tx_loop(void) {
   struct rte_mbuf *bursts[MAX_PKT_BURST];
+  // cpu core that only sends the packets
 
   while (!force_quit) {
     uint16_t n =
@@ -260,10 +278,10 @@ static int lcore_main(__rte_unused void *arg) {
     io_rx_loop();
     break;
   case LCORE_WORKER1:
-    worker_pattern1_loop();
+    worker_multi_queue(0, 4);
     break;
   case LCORE_WORKER2:
-    worker_default_loop();
+    worker_multi_queue(4, 8);
     break;
   case LCORE_TX:
     tx_loop();
@@ -320,14 +338,20 @@ int main(int argc, char **argv) {
 
   task_ring = rte_ring_create("tasks", RING_SIZE, rte_socket_id(),
                               RING_F_SP_ENQ | RING_F_MC_HTS_DEQ);
-  pattern1_ring =
-      rte_ring_create("pattern1", RING_SIZE, rte_socket_id(), RING_F_SC_DEQ);
-  default_ring =
-      rte_ring_create("default", RING_SIZE, rte_socket_id(), RING_F_SC_DEQ);
   tx_ring =
       rte_ring_create("tx", RING_SIZE * 2, rte_socket_id(), RING_F_SC_DEQ);
 
-  if (!task_ring || !pattern1_ring || !default_ring || !tx_ring)
+  for (int i = 0; i < 8; ++i) {
+    char name[10];
+    snprintf(name, sizeof(name), "pq%d", i);
+    profile_queue[i] =
+        rte_ring_create(name, RING_SIZE, rte_socket_id(), RING_F_SP_ENQ);
+    if (!profile_queue[i]) {
+      rte_exit(EXIT_FAILURE, "ring creation error\n");
+    }
+  }
+
+  if (!task_ring || !tx_ring)
     rte_exit(EXIT_FAILURE, "ring creation error\n");
 
   init_classifier_pool();
