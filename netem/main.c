@@ -32,6 +32,7 @@
 #include <rte_ethdev.h>
 #include <rte_mempool.h>
 #include <rte_mbuf.h>
+#include <rte_mbuf_dyn.h>
 #include <rte_string_fns.h>
 
 static volatile bool force_quit;
@@ -86,6 +87,36 @@ static struct rte_eth_conf port_conf = {
 };
 
 struct rte_mempool * netem_pktmbuf_pool = NULL;
+
+/* Dynamic mbuf field used to store the packet release timestamp.
+ * This replaces the old rte_mbuf::udata64 field, which is not available
+ * in newer DPDK versions. */
+#define RELEASE_TIME_DYNFIELD_NAME "netem_release_time"
+static int release_time_dynfield_offset = -1;
+
+static inline uint64_t *
+mbuf_release_time(struct rte_mbuf *m)
+{
+	return RTE_MBUF_DYNFIELD(m, release_time_dynfield_offset, uint64_t *);
+}
+
+static void
+register_release_time_dynfield(void)
+{
+	static const struct rte_mbuf_dynfield release_time_dynfield_desc = {
+		.name = RELEASE_TIME_DYNFIELD_NAME,
+		.size = sizeof(uint64_t),
+		.align = __alignof__(uint64_t),
+		.flags = 0,
+	};
+
+	release_time_dynfield_offset =
+		rte_mbuf_dynfield_register(&release_time_dynfield_desc);
+	if (release_time_dynfield_offset < 0)
+		rte_exit(EXIT_FAILURE,
+			"Cannot register release_time dynamic field\n");
+}
+
 
 /* Per-port statistics struct */
 struct __rte_cache_aligned netem_port_statistics {
@@ -295,7 +326,7 @@ worker_thread(void *arg)
 			struct rte_mbuf *clone =
 				rte_pktmbuf_clone(m, netem_pktmbuf_pool);
 			if (clone != NULL) {
-				clone->udata64 = release;
+				*mbuf_release_time(clone) = release;
 				if (rte_ring_enqueue(queue_rings[queue_id], clone) < 0) {
 					rte_pktmbuf_free(clone);
 					port_statistics[rx_port].dropped++;
@@ -306,7 +337,7 @@ worker_thread(void *arg)
 		}
 
 		/* Stamp the original and push */
-		m->udata64 = release;
+		*mbuf_release_time(m) = release;
 		if (rte_ring_enqueue(queue_rings[queue_id], m) < 0) {
 			rte_pktmbuf_free(m);
 			port_statistics[rx_port].dropped++;
@@ -348,10 +379,11 @@ tx_thread(__rte_unused void *arg)
 		for (int q = 0; q < NUM_PROFILE_QUEUES; q++) {
 			if (pending[q] == NULL)
 				continue;
-			if (pending[q]->udata64 > cur_tsc)
+			uint64_t release_time = *mbuf_release_time(pending[q]);
+			if (release_time > cur_tsc)
 				continue;
-			if (pending[q]->udata64 < best_time) {
-				best_time = pending[q]->udata64;
+			if (release_time < best_time) {
+				best_time = release_time;
 				best_q = q;
 			}
 		}
@@ -425,6 +457,8 @@ main(int argc, char **argv)
 		rte_exit(EXIT_FAILURE, "Invalid EAL arguments\n");
 	argc -= ret;
 	argv += ret;
+
+	register_release_time_dynfield();
 
 	/* Create the input ring: RX is the sole producer (SP),
 	 * workers are multiple consumers (no SC flag). */
