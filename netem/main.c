@@ -1,22 +1,20 @@
 #include <arpa/inet.h>
-#include <ctype.h>
 #include <errno.h>
-#include <getopt.h>
 #include <inttypes.h>
 #include <netinet/in.h>
+#include <pthread.h>
+#include <semaphore.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/queue.h>
 #include <sys/types.h>
 
 #include <rte_branch_prediction.h>
 #include <rte_common.h>
 #include <rte_cycles.h>
-#include <rte_debug.h>
 #include <rte_eal.h>
 #include <rte_ethdev.h>
 #include <rte_ether.h>
@@ -25,12 +23,10 @@
 #include <rte_log.h>
 #include <rte_malloc.h>
 #include <rte_mbuf.h>
-#include <rte_memory.h>
 #include <rte_mempool.h>
 #include <rte_per_lcore.h>
 #include <rte_prefetch.h>
 #include <rte_ring.h>
-#include <rte_string_fns.h>
 
 #define RTE_LOGTYPE_NETEM RTE_LOGTYPE_USER1
 
@@ -40,7 +36,8 @@
 #define RX_DESC_DEFAULT 1024
 #define TX_DESC_DEFAULT 1024
 #define NB_PORTS 2
-#define RING_SIZE 2048
+#define RING_SIZE 4096
+#define N_CLASS_THREADS 4
 
 #define LCORE_RX 0
 #define LCORE_WORKER1 1
@@ -56,9 +53,13 @@ static struct rte_ether_addr netem_ports_eth_addr[NB_PORTS];
 static struct rte_eth_dev_tx_buffer *tx_buffer[NB_PORTS];
 static struct rte_mempool *netem_pktmbuf_pool;
 
+static struct rte_ring *task_ring;
 static struct rte_ring *pattern1_ring;
 static struct rte_ring *default_ring;
 static struct rte_ring *tx_ring;
+
+static pthread_t class_threads[N_CLASS_THREADS];
+static sem_t semaphore;
 
 static uint64_t timer_period = 1;
 
@@ -109,11 +110,55 @@ static void print_stats(void) {
   fflush(stdout);
 }
 
+static void *classifier_thread(__rte_unused void *arg) {
+  struct rte_mbuf *m;
+
+  while (!force_quit) {
+
+    sem_wait(&semaphore);
+    if (force_quit) {
+      return NULL;
+    }
+
+    if (rte_ring_dequeue(task_ring, (void **)&m) < 0) {
+      continue;
+    }
+
+    rte_prefetch0(rte_pktmbuf_mtod(m, void *));
+
+    struct rte_ring *dst = default_ring;
+    struct rte_ether_hdr *eth = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
+
+    if (eth->ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4)) {
+      struct rte_ipv4_hdr *ip = (struct rte_ipv4_hdr *)(eth + 1);
+      uint32_t src = rte_be_to_cpu_32(ip->src_addr);
+
+      if (((src >> 24) & 0xFF) == 30 && ((src >> 16) & 0xFF) == 0 &&
+          ((src >> 8) & 0xFF) == 0)
+        dst = pattern1_ring;
+    }
+
+    if (rte_ring_enqueue(dst, m) < 0) {
+      rte_pktmbuf_free(m);
+      port_statistics[0].dropped++;
+    }
+  }
+
+  return NULL;
+}
+
+static void init_classifier_pool(void) {
+  for (int i = 0; i < N_CLASS_THREADS; i++)
+    pthread_create(&class_threads[i], NULL, classifier_thread, NULL);
+}
+
+static void destroy_classifier_pool(void) {
+  for (int i = 0; i < N_CLASS_THREADS; i++)
+    pthread_join(class_threads[i], NULL);
+}
+
 static void io_rx_loop(void) {
   struct rte_mbuf *bursts[MAX_PKT_BURST];
-  struct rte_mbuf *pattern1[MAX_PKT_BURST];
-  struct rte_mbuf *def[MAX_PKT_BURST];
-
   uint64_t prev_tsc = 0, timer_tsc = 0;
   const uint64_t drain_tsc =
       (rte_get_tsc_hz() + US_PER_S - 1) / US_PER_S * BURST_TX_DRAIN_US;
@@ -139,50 +184,23 @@ static void io_rx_loop(void) {
 
     port_statistics[0].rx += nb_rx;
 
-    uint16_t pattern1_count = 0, default_count = 0;
+    uint16_t enqueued =
+        rte_ring_enqueue_burst(task_ring, (void **)bursts, nb_rx, NULL);
 
-    for (uint16_t i = 0; i < nb_rx; i++) {
-      struct rte_mbuf *m = bursts[i];
-      rte_prefetch0(rte_pktmbuf_mtod(m, void *));
-
-      struct rte_ether_hdr *eth = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
-
-      if (eth->ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4)) {
-        struct rte_ipv4_hdr *ip = (struct rte_ipv4_hdr *)(eth + 1);
-        uint32_t src = rte_be_to_cpu_32(ip->src_addr);
-
-        if (((src >> 24) & 0xFF) == 30 && ((src >> 16) & 0xFF) == 0 &&
-            ((src >> 8) & 0xFF) == 0) {
-          pattern1[pattern1_count++] = m;
-          continue;
-        }
-      }
-      def[default_count++] = m;
+    for (int i = 0; i < enqueued; i++) {
+      sem_post(&semaphore);
     }
 
-    if (pattern1_count) {
-      uint16_t enqueued = rte_ring_enqueue_burst(
-          pattern1_ring, (void **)pattern1, pattern1_count, NULL);
-      for (uint16_t i = enqueued; i < pattern1_count; i++) {
-        rte_pktmbuf_free(pattern1[i]);
-        port_statistics[0].dropped++;
-      }
-    }
-
-    if (default_count) {
-      uint16_t enqueued = rte_ring_enqueue_burst(default_ring, (void **)def,
-                                                 default_count, NULL);
-      for (uint16_t i = enqueued; i < default_count; i++) {
-        rte_pktmbuf_free(def[i]);
-        port_statistics[0].dropped++;
-      }
+    for (uint16_t i = enqueued; i < nb_rx; i++) {
+      rte_pktmbuf_free(bursts[i]);
+      port_statistics[0].dropped++;
     }
   }
 }
 
 static void worker_pattern1_loop(void) {
   struct rte_mbuf *bursts[MAX_PKT_BURST];
-  struct rte_mbuf *output[MAX_PKT_BURST * 2];
+  struct rte_mbuf *out[MAX_PKT_BURST * 2];
 
   while (!force_quit) {
     uint16_t n = rte_ring_dequeue_burst(pattern1_ring, (void **)bursts,
@@ -190,19 +208,19 @@ static void worker_pattern1_loop(void) {
     if (!n)
       continue;
 
-    uint16_t output_number = 0;
+    uint16_t out_n = 0;
     for (uint16_t i = 0; i < n; i++) {
-      output[output_number++] = bursts[i];
+      out[out_n++] = bursts[i];
       if (i % 2 == 0)
-        output[output_number++] = bursts[i];
+        out[out_n++] = bursts[i];
     }
 
     uint16_t enqueued =
-        rte_ring_enqueue_burst(tx_ring, (void **)output, output_number, NULL);
+        rte_ring_enqueue_burst(tx_ring, (void **)out, out_n, NULL);
     port_statistics[1].pattern1 += enqueued;
 
-    for (uint16_t i = enqueued; i < output_number; i++) {
-      rte_pktmbuf_free(output[i]);
+    for (uint16_t i = enqueued; i < out_n; i++) {
+      rte_pktmbuf_free(out[i]);
       port_statistics[1].dropped++;
     }
   }
@@ -262,7 +280,7 @@ static int lcore_main(__rte_unused void *arg) {
     tx_loop();
     break;
   default:
-    RTE_LOG(WARNING, NETEM, "lcore %u has no assigned role\n", id);
+    printf("error on a core\n");
     break;
   }
   return 0;
@@ -272,6 +290,9 @@ static void signal_handler(int signum) {
   if (signum == SIGINT || signum == SIGTERM) {
     printf("\n\nSignal %d received, preparing to exit...\n", signum);
     force_quit = true;
+    for (int i = 0; i < N_CLASS_THREADS; i++) {
+      sem_post(&semaphore);
+    }
   }
 }
 
@@ -311,15 +332,20 @@ int main(int argc, char **argv) {
   if (!netem_pktmbuf_pool)
     rte_exit(EXIT_FAILURE, "Cannot init mbuf pool\n");
 
-  pattern1_ring = rte_ring_create("pattern1", RING_SIZE, rte_socket_id(),
-                                  RING_F_SP_ENQ | RING_F_SC_DEQ);
-  default_ring = rte_ring_create("default", RING_SIZE, rte_socket_id(),
-                                 RING_F_SP_ENQ | RING_F_SC_DEQ);
+  task_ring =
+      rte_ring_create("tasks", RING_SIZE, rte_socket_id(), RING_F_SP_ENQ);
+  pattern1_ring =
+      rte_ring_create("pattern1", RING_SIZE, rte_socket_id(), RING_F_SC_DEQ);
+  default_ring =
+      rte_ring_create("default", RING_SIZE, rte_socket_id(), RING_F_SC_DEQ);
   tx_ring =
       rte_ring_create("tx", RING_SIZE * 2, rte_socket_id(), RING_F_SC_DEQ);
 
-  if (!pattern1_ring || !default_ring || !tx_ring)
-    rte_exit(EXIT_FAILURE, "Cannot create rings\n");
+  if (!task_ring || !pattern1_ring || !default_ring || !tx_ring)
+    rte_exit(EXIT_FAILURE, "ring creation error\n");
+
+  init_classifier_pool();
+  sem_init(&semaphore, 0, 0);
 
   RTE_ETH_FOREACH_DEV(portid) {
     struct rte_eth_rxconf rxq_conf;
@@ -416,6 +442,8 @@ int main(int argc, char **argv) {
     }
   }
 
+  destroy_classifier_pool();
+
   RTE_ETH_FOREACH_DEV(portid) {
     printf("Closing port %d...", portid);
     ret = rte_eth_dev_stop(portid);
@@ -426,6 +454,7 @@ int main(int argc, char **argv) {
   }
 
   rte_eal_cleanup();
+  sem_destroy(&semaphore);
   printf("Bye...\n");
   return ret;
 }
