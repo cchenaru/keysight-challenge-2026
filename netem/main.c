@@ -35,6 +35,19 @@
 
 static volatile bool force_quit;
 
+static const uint8_t patterns[10][12] = {
+    "000000000001",
+    "000000000010",
+    "000000000100",
+    "000000001000",
+    "000000010000",
+    "000000100000",
+    "000001000000",
+    "000010000000",
+    "000100000000",
+    "001000000000"
+};
+
 #define RTE_LOGTYPE_NETEM RTE_LOGTYPE_USER1
 
 #define MAX_PKT_BURST 32
@@ -75,6 +88,31 @@ struct netem_port_statistics port_statistics[NB_PORTS];
 
 /* A tsc-based timer responsible for triggering statistics printout */
 static uint64_t timer_period = 1; /* default period is 1 seconds */
+
+static inline int
+classify_packet(struct rte_mbuf *m)
+{
+    uint8_t *data;
+    int i;
+
+    data = rte_pktmbuf_mtod(m, uint8_t *);
+
+    /*
+     * Check to be at least 12 bytes.
+     */
+    if (rte_pktmbuf_pkt_len(m) < 12)
+        return 0;
+
+    for (i = 0; i < 10; i++) {
+        if (memcmp(data, patterns[i], 12) == 0)
+            return i;
+    }
+
+    /*
+     * Default queue.
+     */
+    return 0;
+}
 
 /* Print out statistics on packets dropped */
 static void
@@ -179,7 +217,7 @@ netem_main_loop(void)
 
 					/* do this only on main core */
 					if (lcore_id == rte_get_main_lcore()) {
-						print_stats();
+						// print_stats();
 						/* reset the timer */
 						timer_tsc = 0;
 					}
@@ -200,14 +238,27 @@ netem_main_loop(void)
 		for (i = 0; i < nb_rx; i++) {
 			m = pkts_burst[i];
 
-			/* Drop one in 10 packets, the 5th one. */
-			if (i % 10 == 5) {
-				/* ToDo: correctly drop based on total RX packets, not
-				 * while iterating the burst (e.g. 32 packets burst)
-				 */
-				rte_pktmbuf_free(m);
-				continue;
+			// Clasify packet
+			int queue_id = classify_packet(m);
+
+			uint8_t *data = rte_pktmbuf_mtod(m, uint8_t *);
+
+			printf("queue_id=%d | first 12 bytes: ", queue_id);
+
+			for (int j = 0; j < 12; j++) {
+			printf("%c", data[j]);
 			}
+
+			printf("\n");
+
+			/* Drop one in 10 packets, the 5th one. */
+			// if (i % 10 == 5) {
+			// 	/* ToDo: correctly drop based on total RX packets, not
+			// 	 * while iterating the burst (e.g. 32 packets burst)
+			// 	 */
+			// 	rte_pktmbuf_free(m);
+			// 	continue;
+			// }
 
 			rte_prefetch0(rte_pktmbuf_mtod(m, void *));
 
