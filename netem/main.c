@@ -3,7 +3,7 @@
 #include <inttypes.h>
 #include <netinet/in.h>
 #include <pthread.h>
-#include <semaphore.h>
+#include <rte_ring_core.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -59,7 +59,6 @@ static struct rte_ring *default_ring;
 static struct rte_ring *tx_ring;
 
 static pthread_t class_threads[N_CLASS_THREADS];
-static sem_t semaphore;
 
 static uint64_t timer_period = 1;
 
@@ -115,12 +114,8 @@ static void *classifier_thread(__rte_unused void *arg) {
 
   while (!force_quit) {
 
-    sem_wait(&semaphore);
-    if (force_quit) {
-      return NULL;
-    }
-
     if (rte_ring_dequeue(task_ring, (void **)&m) < 0) {
+      rte_pause();
       continue;
     }
 
@@ -187,10 +182,6 @@ static void io_rx_loop(void) {
     uint16_t enqueued =
         rte_ring_enqueue_burst(task_ring, (void **)bursts, nb_rx, NULL);
 
-    for (int i = 0; i < enqueued; i++) {
-      sem_post(&semaphore);
-    }
-
     for (uint16_t i = enqueued; i < nb_rx; i++) {
       rte_pktmbuf_free(bursts[i]);
       port_statistics[0].dropped++;
@@ -211,8 +202,6 @@ static void worker_pattern1_loop(void) {
     uint16_t out_n = 0;
     for (uint16_t i = 0; i < n; i++) {
       out[out_n++] = bursts[i];
-      if (i % 2 == 0)
-        out[out_n++] = bursts[i];
     }
 
     uint16_t enqueued =
@@ -290,9 +279,6 @@ static void signal_handler(int signum) {
   if (signum == SIGINT || signum == SIGTERM) {
     printf("\n\nSignal %d received, preparing to exit...\n", signum);
     force_quit = true;
-    for (int i = 0; i < N_CLASS_THREADS; i++) {
-      sem_post(&semaphore);
-    }
   }
 }
 
@@ -332,8 +318,8 @@ int main(int argc, char **argv) {
   if (!netem_pktmbuf_pool)
     rte_exit(EXIT_FAILURE, "Cannot init mbuf pool\n");
 
-  task_ring =
-      rte_ring_create("tasks", RING_SIZE, rte_socket_id(), RING_F_SP_ENQ);
+  task_ring = rte_ring_create("tasks", RING_SIZE, rte_socket_id(),
+                              RING_F_SP_ENQ | RING_F_MC_HTS_DEQ);
   pattern1_ring =
       rte_ring_create("pattern1", RING_SIZE, rte_socket_id(), RING_F_SC_DEQ);
   default_ring =
@@ -345,7 +331,6 @@ int main(int argc, char **argv) {
     rte_exit(EXIT_FAILURE, "ring creation error\n");
 
   init_classifier_pool();
-  sem_init(&semaphore, 0, 0);
 
   RTE_ETH_FOREACH_DEV(portid) {
     struct rte_eth_rxconf rxq_conf;
@@ -454,7 +439,6 @@ int main(int argc, char **argv) {
   }
 
   rte_eal_cleanup();
-  sem_destroy(&semaphore);
   printf("Bye...\n");
   return ret;
 }
