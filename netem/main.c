@@ -67,9 +67,7 @@ static struct rte_eth_conf port_conf = {
 
 struct rte_mempool * netem_pktmbuf_pool = NULL;
 
-/* Dynamic mbuf field used to store the packet release timestamp.
- * This replaces the old rte_mbuf::udata64 field, which is not available
- * in newer DPDK versions. */
+/* Dynamic mbuf field used to store the packet release timestamp */
 #define RELEASE_TIME_DYNFIELD_NAME "netem_release_time"
 static int release_time_dynfield_offset = -1;
 
@@ -109,23 +107,23 @@ struct netem_port_statistics port_statistics[NB_PORTS];
 static uint64_t timer_period = 1; /* default period is 1 seconds */
 
 // The queues
-#define NUM_PROFILE_QUEUES 10
-#define NUM_WORKERS 2
+#define NUM_PATTERN_QUEUES 10
+#define NUM_PROFILE_QUEUES 11
+#define DEFAULT_QUEUE_ID 10
+#define NUM_WORKERS 2	/* 2 threads for proccessing the packets */
 #define QUEUE_SIZE 4096
 #define INPUT_RING_SIZE 4096
 
-/* Input ring: RX thread pushes raw packets, workers consume */
+/* Input ring- RX thread pushes raw packets, workers consume */
 static struct rte_ring *input_ring;
 
 /* Per-queue rings: workers push processed (timestamped) packets, TX consumes */
 static struct rte_ring *queue_rings[NUM_PROFILE_QUEUES];
 
-/* TX-side "pending head" — one held-back packet per queue while waiting
- * for its release_time to arrive */
 static struct rte_mbuf *pending[NUM_PROFILE_QUEUES];
 
 /* Per-queue packet counter for deterministic drop/dup decisions.
- * Multiple workers may touch the same queue — use atomic add. */
+ */
 static uint64_t pkt_count[NUM_PROFILE_QUEUES];
 
 /* Fixed ports: RX from port 0, TX to port 1 */
@@ -140,27 +138,25 @@ struct queue_rule {
 
 static struct queue_rule queue_rules[NUM_PROFILE_QUEUES] = {
     /*  drop_every, dup_every, delay_us */
-    {   0,           0,         0     },   /* PQ0: passthrough */
-    {  10,           0,         0     },   /* PQ1: drop 1/10 */
-    {   5,           0,         0     },   /* PQ2: drop 1/5 */
-    {   0,           0,         0     },   /* PQ3: dup 1/10 */
-    {   0,           3,         0     },   /* PQ4: dup 1/3 */
-    {   0,           0,      1000     },   /* PQ5: 1ms delay */
-    {   0,           0,     10000     },   /* PQ6: 10ms delay */
-    {  10,          10,         0     },   /* PQ7: drop + dup */
-    {   5,           0,      1000     },   /* PQ8: drop + delay */
-    {   0,           5,     10000     },   /* PQ9: dup + delay */
+    {   0,           0,         0     },   /* Q0: passthrough */
+    {  10,           0,         0     },   /* Q1: drop 1/10 */
+    {   5,           0,         0     },   /* Q2: drop 1/5 */
+    {   0,           0,         0     },   /* Q3: no action */
+    {   0,           3,         0     },   /* Q4: dup 1/3 */
+    {   0,           0,      1000     },   /* Q5: 1ms delay */
+    {   0,           0,     10000     },   /* Q6: 10ms delay */
+    {  10,          10,         0     },   /* Q7: drop + dup */
+    {   5,           0,      1000     },   /* Q8: drop + delay */
+    {   0,           5,     10000     },   /* Q9: dup + delay */
+    {   0,           0,         0     },   /* 10: default queue */
 };
 
-/* 10 hardcoded (flow_id, direction) patterns.
- * direction byte is at offset 8 (cc or cd in the pcap),
- * flow_id byte is at offset 30. */
 #define PATTERN_SIZE 12
 struct pattern {
     uint8_t bytes[PATTERN_SIZE];
 };
 
-static const struct pattern patterns[NUM_PROFILE_QUEUES] = {
+static const struct pattern patterns[NUM_PATTERN_QUEUES] = {
     { { 0xaa, 0xbb, 0xcc, 0x00, 0x00, 0x00, 0xab, 0xbb, 0xcd, 0x00, 0x00, 0x00 } }, /* PQ0 */
     { { 0xaa, 0xbb, 0xcc, 0x00, 0x00, 0x00, 0xaa, 0xbb, 0xcd, 0x00, 0x00, 0x00 } }, /* PQ1 */
     { { 0xaa, 0xbb, 0xcc, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 } }, /* PQ2 */
@@ -183,14 +179,19 @@ classify_packet(struct rte_mbuf *m)
     len = rte_pktmbuf_pkt_len(m);
 
     if (len < PATTERN_SIZE)
-        return NUM_PROFILE_QUEUES - 1;
+        return DEFAULT_QUEUE_ID;
 
-    for (int i = 0; i < NUM_PROFILE_QUEUES; i++) {
-        if (memcmp(data, patterns[i].bytes, PATTERN_SIZE) == 0)
-            return i;
+	/**
+	 * Search for the pattern everywhere in the packet
+	 */
+    for (uint32_t offset = 0; offset <= len - PATTERN_SIZE; offset++) {
+        for (int i = 0; i < NUM_PATTERN_QUEUES; i++) {
+            if (memcmp(data + offset, patterns[i].bytes, PATTERN_SIZE) == 0)
+                return i;
+        }
     }
 
-    return NUM_PROFILE_QUEUES - 1;
+    return DEFAULT_QUEUE_ID;
 }
 
 /* Print out statistics on packets dropped */
@@ -238,15 +239,12 @@ print_stats(void)
 	fflush(stdout);
 }
 
-/* RX thread: read packets from input port, push raw into input_ring. */
+/* RX thread- read packets from input port, push raw into input_ring */
 static int
 rx_thread(__rte_unused void *arg)
 {
 	struct rte_mbuf *pkts_burst[MAX_PKT_BURST];
 	unsigned nb_rx;
-
-	printf("RX thread on lcore %u, rx_port %u\n", rte_lcore_id(), rx_port);
-	RTE_LOG(INFO, NETEM, "entering RX loop on lcore %u\n", rte_lcore_id());
 
 	while (!force_quit) {
 		/* Read packet from RX queue */
@@ -257,12 +255,11 @@ rx_thread(__rte_unused void *arg)
 
 		port_statistics[rx_port].rx += nb_rx;
 
-		/* Push the whole burst into input_ring at once. */
+		/* Push the whole burst into input_ring at once */
 		unsigned enq = rte_ring_enqueue_burst(input_ring,
 		                                     (void **)pkts_burst,
 		                                     nb_rx, NULL);
 
-		/* Any packets that didn't fit get dropped. */
 		for (unsigned i = enq; i < nb_rx; i++) {
 			rte_pktmbuf_free(pkts_burst[i]);
 			port_statistics[rx_port].dropped++;
@@ -271,16 +268,13 @@ rx_thread(__rte_unused void *arg)
 	return 0;
 }
 
-/* Worker thread: pop from input_ring, classify, apply drop/duplicate,
- * stamp release_time, push to queue_rings[q]. */
+/* Worker thread- pop from input_ring, classify, apply drop/duplicate,
+ * stamp release_time, push to queue_rings[q] */
 static int
 worker_thread(void *arg)
 {
 	int worker_id = (int)(uintptr_t)arg;
 	struct rte_mbuf *m;
-
-	printf("Worker %d on lcore %u\n", worker_id, rte_lcore_id());
-	RTE_LOG(INFO, NETEM, "entering worker loop on lcore %u\n", rte_lcore_id());
 
 	while (!force_quit) {
 		if (rte_ring_dequeue(input_ring, (void **)&m) != 0)
@@ -336,7 +330,7 @@ worker_thread(void *arg)
 }
 
 /* TX thread: peek each queue_ring, pick the packet with the earliest
- * release_time that's already due, send it out. */
+ * release_time that's already due, send it out */
 static int
 tx_thread(__rte_unused void *arg)
 {
@@ -349,9 +343,6 @@ tx_thread(__rte_unused void *arg)
 	prev_tsc = 0;
 	timer_tsc = 0;
 
-	printf("TX thread on lcore %u, tx_port %u\n", rte_lcore_id(), tx_port);
-	RTE_LOG(INFO, NETEM, "entering TX loop on lcore %u\n", rte_lcore_id());
-
 	while (!force_quit) {
 		cur_tsc = rte_rdtsc();
 
@@ -362,7 +353,7 @@ tx_thread(__rte_unused void *arg)
 		}
 
 		/* Find the queue whose pending packet has the smallest
-		 * release_time AND is already due (release_time <= now). */
+		 * release_time AND is already due  */
 		int best_q = -1;
 		uint64_t best_time = UINT64_MAX;
 		for (int q = 0; q < NUM_PROFILE_QUEUES; q++) {
@@ -604,11 +595,6 @@ main(int argc, char **argv)
 		rte_exit(EXIT_FAILURE, "No ports available\n");
 	}
 
-	/* Lcore assignment:
-	 *   main lcore   -> TX thread (runs inline)
-	 *   first worker -> RX thread
-	 *   rest         -> worker threads (NUM_WORKERS of them)
-	 * Requires at least NUM_WORKERS + 2 lcores. Pass -l 0-3 (or wider). */
 	unsigned int rx_lcore = 0;
 	unsigned int worker_lcores[NUM_WORKERS];
 	int wi = 0;
