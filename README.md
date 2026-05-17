@@ -1,3 +1,5 @@
+For challenge specific README, check /neteme/README.md. Hope you will find out implementation interesting : )
+
 # Keysight Student Challenge 2026
 ## Implement a Network Emulator to Duplicate, Drop, and Shape Network Traffic
 

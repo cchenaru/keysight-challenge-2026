@@ -11,6 +11,7 @@ dpdk = dependency('libdpdk', required: true)
 # 2. Define your source files (similar to l2fwd)
 sources = files(
     'main.c',
+    'threads.c'
     # Add other .c files here if you have them
 )
 
