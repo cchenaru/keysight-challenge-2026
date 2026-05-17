@@ -37,27 +37,6 @@
 
 static volatile bool force_quit;
 
-/* 10 hardcoded (flow_id, direction) patterns.
- * direction byte is at offset 8 (cc or cd in the pcap),
- * flow_id byte is at offset 30. */
-struct pattern {
-    uint8_t flow_id;
-    uint8_t direction;
-};
-
-static const struct pattern patterns[10] = {
-    { 0x16, 0xcd },   /* PQ0 */
-    { 0x16, 0xcc },   /* PQ1 */
-    { 0x26, 0xcd },   /* PQ2 */
-    { 0x26, 0xcc },   /* PQ3 */
-    { 0x36, 0xcd },   /* PQ4 */
-    { 0x36, 0xcc },   /* PQ5 */
-    { 0x53, 0xcd },   /* PQ6 */
-    { 0x53, 0xcc },   /* PQ7 */
-    { 0x63, 0xcd },   /* PQ8 */
-    { 0x63, 0xcc },   /* PQ9 */
-};
-
 #define RTE_LOGTYPE_NETEM RTE_LOGTYPE_USER1
 
 #define MAX_PKT_BURST 32
@@ -164,7 +143,7 @@ static struct queue_rule queue_rules[NUM_PROFILE_QUEUES] = {
     {   0,           0,         0     },   /* PQ0: passthrough */
     {  10,           0,         0     },   /* PQ1: drop 1/10 */
     {   5,           0,         0     },   /* PQ2: drop 1/5 */
-    {   0,          10,         0     },   /* PQ3: dup 1/10 */
+    {   0,           0,         0     },   /* PQ3: dup 1/10 */
     {   0,           3,         0     },   /* PQ4: dup 1/3 */
     {   0,           0,      1000     },   /* PQ5: 1ms delay */
     {   0,           0,     10000     },   /* PQ6: 10ms delay */
@@ -173,34 +152,44 @@ static struct queue_rule queue_rules[NUM_PROFILE_QUEUES] = {
     {   0,           5,     10000     },   /* PQ9: dup + delay */
 };
 
+/* 10 hardcoded (flow_id, direction) patterns.
+ * direction byte is at offset 8 (cc or cd in the pcap),
+ * flow_id byte is at offset 30. */
+#define PATTERN_SIZE 12
+struct pattern {
+    uint8_t bytes[PATTERN_SIZE];
+};
+
+static const struct pattern patterns[NUM_PROFILE_QUEUES] = {
+    { { 0xaa, 0xbb, 0xcc, 0x00, 0x00, 0x00, 0xab, 0xbb, 0xcd, 0x00, 0x00, 0x00 } }, /* PQ0 */
+    { { 0xaa, 0xbb, 0xcc, 0x00, 0x00, 0x00, 0xaa, 0xbb, 0xcd, 0x00, 0x00, 0x00 } }, /* PQ1 */
+    { { 0xaa, 0xbb, 0xcc, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 } }, /* PQ2 */
+    { { 0xaa, 0xbb, 0xcc, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 } }, /* PQ3 */
+    { { 0xaa, 0xbb, 0xcc, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 } }, /* PQ4 */
+    { { 0xaa, 0xbb, 0xcc, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 } }, /* PQ5 */
+    { { 0xaa, 0xbb, 0xcc, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 } }, /* PQ6 */
+    { { 0xaa, 0xbb, 0xcc, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 } }, /* PQ7 */
+    { { 0xaa, 0xbb, 0xcc, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 } }, /* PQ8 */
+    { { 0xaa, 0xbb, 0xcc, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 } }, /* PQ9 */
+};
+
 static inline int
 classify_packet(struct rte_mbuf *m)
 {
     uint8_t *data;
     uint32_t len;
-    int i;
 
     data = rte_pktmbuf_mtod(m, uint8_t *);
     len = rte_pktmbuf_pkt_len(m);
 
-    /*
-     * Check to be at least 32 bytes (we look at byte 8 and byte 30).
-     */
-    if (len < 32)
-        return NUM_PROFILE_QUEUES - 1;  /* default queue */
+    if (len < PATTERN_SIZE)
+        return NUM_PROFILE_QUEUES - 1;
 
-    uint8_t direction = data[8];
-    uint8_t flow_id   = data[30];
-
-    for (i = 0; i < NUM_PROFILE_QUEUES; i++) {
-        if (patterns[i].flow_id == flow_id &&
-            patterns[i].direction == direction)
+    for (int i = 0; i < NUM_PROFILE_QUEUES; i++) {
+        if (memcmp(data, patterns[i].bytes, PATTERN_SIZE) == 0)
             return i;
     }
 
-    /*
-     * Default queue.
-     */
     return NUM_PROFILE_QUEUES - 1;
 }
 
